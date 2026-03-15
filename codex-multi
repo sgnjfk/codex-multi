@@ -47,20 +47,70 @@ cmd_add() {
   local dir="$ACCOUNTS_DIR/$name"
   mkdir -p "$dir"
 
-  if [ -t 0 ] && [ -n "${SSH_CONNECTION:-}" ]; then
-    dim "Headless SSH detected. Options:"
-    dim "  1. Login on PC:  CODEX_HOME=/tmp/$name codex login"
-    dim "     Then copy:    scp /tmp/$name/auth.json $(whoami)@$(hostname):$dir/"
-    dim "  2. Or import:    codex-multi import $name /path/to/auth.json"
-    dim ""
-    dim "Attempting login anyway (may not work without local browser)..."
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    cmd_add_remote "$name"
+  else
+    echo "Logging in as '$name'..."
+    CODEX_HOME="$dir" codex login
+    local email=$(get_email "$dir")
+    [ -n "$email" ] && green "Added: $name ($email)" || green "Added: $name"
+    [ ! -f "$DEFAULT_FILE" ] && echo "$name" > "$DEFAULT_FILE" && dim "Set as default"
+  fi
+}
+
+cmd_add_remote() {
+  local name="$1"
+  local dir="$ACCOUNTS_DIR/$name"
+
+  # Start codex login in background — it listens on 127.0.0.1:1455
+  CODEX_HOME="$dir" codex login &
+  local login_pid=$!
+  sleep 2
+
+  # Extract OAuth URL from codex output (if available), otherwise guide user
+  echo ""
+  dim "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  dim "Remote login mode"
+  dim "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  dim "1. Open the OAuth URL above in your browser"
+  dim "2. Login with your ChatGPT account"
+  dim "3. Browser will redirect to http://127.0.0.1:1455/... (will fail)"
+  dim "4. Copy the FULL URL from the browser address bar"
+  dim "5. Paste it below:"
+  echo ""
+  printf '\033[1;36m> Callback URL: \033[0m'
+  read -r callback_url
+
+  if [ -z "$callback_url" ]; then
+    red "No URL provided"
+    kill "$login_pid" 2>/dev/null; wait "$login_pid" 2>/dev/null
+    exit 1
   fi
 
-  echo "Logging in as '$name'..."
-  CODEX_HOME="$dir" codex login
-  local email=$(get_email "$dir")
-  [ -n "$email" ] && green "Added: $name ($email)" || green "Added: $name"
-  [ ! -f "$DEFAULT_FILE" ] && echo "$name" > "$DEFAULT_FILE" && dim "Set as default"
+  # Forward the callback to codex login running on localhost
+  local path="${callback_url#*127.0.0.1:1455}"
+  path="${path#*localhost:1455}"
+  if [ -z "$path" ] || [ "$path" = "$callback_url" ]; then
+    # User pasted full URL, try as-is replacing host
+    path="${callback_url#http://127.0.0.1:1455}"
+    path="${path#http://localhost:1455}"
+  fi
+
+  dim "Forwarding callback..."
+  curl -s "http://127.0.0.1:1455${path}" > /dev/null 2>&1 || true
+
+  # Wait for codex login to finish
+  wait "$login_pid" 2>/dev/null || true
+
+  if [ -f "$dir/auth.json" ]; then
+    local email=$(get_email "$dir")
+    [ -n "$email" ] && green "Added: $name ($email)" || green "Added: $name"
+    [ ! -f "$DEFAULT_FILE" ] && echo "$name" > "$DEFAULT_FILE" && dim "Set as default"
+  else
+    red "Login failed — auth.json not created"
+    dim "Try: codex-multi import $name /path/to/auth.json"
+  fi
 }
 
 cmd_import() {
