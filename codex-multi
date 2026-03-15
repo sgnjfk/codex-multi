@@ -98,10 +98,18 @@ cmd_add_remote() {
   fi
 
   dim "Forwarding callback..."
-  curl -s "http://127.0.0.1:1455${path}" > /dev/null 2>&1 || true
+  curl -s --max-time 10 "http://127.0.0.1:1455${path}" > /dev/null 2>&1 || true
 
-  # Wait for codex login to finish
-  wait "$login_pid" 2>/dev/null || true
+  # Wait up to 15s for auth.json to appear
+  local waited=0
+  while [ $waited -lt 15 ]; do
+    [ -f "$dir/auth.json" ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  # Cleanup background process
+  kill "$login_pid" 2>/dev/null; wait "$login_pid" 2>/dev/null || true
 
   if [ -f "$dir/auth.json" ]; then
     local email=$(get_email "$dir")
