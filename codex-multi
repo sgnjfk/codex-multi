@@ -294,13 +294,13 @@ except: print('unknown')
 " 2>/dev/null)
 
     if [ "$expired" = "expired" ]; then
-      red "$label: token expired"
-      dim "  → cm reauth $name"
+      red "$label: access token expired (auto-refresh sẽ lấy token mới)"
+      dim "  → Nếu refresh cũng fail: cm reauth $name"
       has_issue=1
     elif [ "$expired" = "unknown" ]; then
       dim "$label: token status unknown"
     else
-      green "$label: token valid (${expired} remaining)"
+      green "$label: OK (access token renew in ${expired}, auto-refresh)"
     fi
   done
 
