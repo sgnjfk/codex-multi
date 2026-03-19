@@ -5,6 +5,7 @@
 #   codex-multi rm <name>         — remove an account
 #   codex-multi ls                — list all accounts
 #   codex-multi use <name>        — set default account
+#   codex-multi balance           — switch to account with most quota
 #   codex-multi status [name]     — check login status
 #   codex-multi <name> [args...]  — run codex with specific account
 #   codex-multi [args...]         — run codex with default account
@@ -358,6 +359,161 @@ for acc in data.get('accounts', []):
   fi
 }
 
+cmd_balance_lb() {
+  local codex_lb_url="http://192.168.1.88:2455"
+  python3 -c "
+import urllib.request, json, os, base64
+
+resp = urllib.request.urlopen('$codex_lb_url/api/accounts', timeout=3)
+data = json.loads(resp.read())
+accounts_dir = '$ACCOUNTS_DIR'
+
+best_name = None
+best_remaining = -1
+
+for acc in data.get('accounts', []):
+    if acc['status'] != 'active':
+        continue
+    email = acc['email']
+    secondary = acc.get('usage', {}).get('secondaryRemainingPercent', 0)
+
+    for name in os.listdir(accounts_dir):
+        auth_file = os.path.join(accounts_dir, name, 'auth.json')
+        if not os.path.isfile(auth_file):
+            continue
+        try:
+            d = json.load(open(auth_file))
+            token = d.get('tokens', {}).get('id_token', '')
+            if token:
+                payload = token.split('.')[1]
+                payload += '=' * (4 - len(payload) % 4)
+                info = json.loads(base64.b64decode(payload))
+                if info.get('email', '') == email:
+                    label = f'{name} ({email})'
+                    print(f'\033[90m  {label}: {secondary:.0f}% remaining\033[0m')
+                    if secondary > best_remaining:
+                        best_remaining = secondary
+                        best_name = name
+        except:
+            pass
+
+if best_name:
+    with open('$1', 'w') as f:
+        f.write(f'{best_name}|{best_remaining}')
+" 2>/dev/null
+}
+
+cmd_balance() {
+  local result_file=$(mktemp)
+
+  # Try codex-lb first (fast, cached)
+  if curl -sf http://192.168.1.88:2455/api/accounts > /dev/null 2>&1; then
+    dim "via codex-lb"
+    cmd_balance_lb "$result_file"
+  fi
+
+  # Fallback: query OpenAI directly
+  if [ ! -s "$result_file" ]; then
+    dim "via OpenAI API"
+    python3 -c "
+import json, os, base64, urllib.request, sys
+
+accounts_dir = '$ACCOUNTS_DIR'
+AUTH_URL = 'https://auth.openai.com/oauth/token'
+USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
+CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
+
+best_name = None
+best_remaining = -1
+
+for name in sorted(os.listdir(accounts_dir)):
+    auth_file = os.path.join(accounts_dir, name, 'auth.json')
+    if not os.path.isfile(auth_file):
+        continue
+
+    try:
+        d = json.load(open(auth_file))
+        refresh_token = d.get('tokens', {}).get('refresh_token', '')
+        if not refresh_token:
+            print(f'\033[90m  {name}: no refresh token\033[0m')
+            continue
+
+        # Get account ID from id_token
+        account_id = ''
+        id_token = d.get('tokens', {}).get('id_token', '')
+        claims = {}
+        if id_token:
+            payload = id_token.split('.')[1]
+            payload += '=' * (4 - len(payload) % 4)
+            claims = json.loads(base64.b64decode(payload))
+            account_id = claims.get('https://api.openai.com/auth', {}).get('chatgpt_account_id', '')
+
+        # Refresh access token
+        req = urllib.request.Request(AUTH_URL, method='POST',
+            data=json.dumps({
+                'grant_type': 'refresh_token',
+                'client_id': CLIENT_ID,
+                'refresh_token': refresh_token,
+                'scope': 'openid profile email'
+            }).encode(),
+            headers={'Content-Type': 'application/json'})
+        resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        access_token = resp.get('access_token', '')
+
+        if not access_token:
+            print(f'\033[31m  {name}: token refresh failed\033[0m')
+            continue
+
+        # Query usage
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        if account_id and not account_id.startswith('email_') and not account_id.startswith('local_'):
+            headers['chatgpt-account-id'] = account_id
+        req = urllib.request.Request(USAGE_URL, headers=headers)
+        usage = json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+        secondary = usage.get('rate_limit', {}).get('secondary_window', {})
+        used = secondary.get('used_percent', 100)
+        remaining = 100 - used
+
+        email = claims.get('email', '')
+        label = f'{name} ({email})' if email else name
+        print(f'\033[90m  {label}: {remaining:.0f}% remaining\033[0m')
+
+        if remaining > best_remaining:
+            best_remaining = remaining
+            best_name = name
+
+    except Exception as e:
+        print(f'\033[31m  {name}: {e}\033[0m')
+        continue
+
+if best_name:
+    with open('$result_file', 'w') as f:
+        f.write(f'{best_name}|{best_remaining}')
+"
+  fi
+
+  local result=$(cat "$result_file" 2>/dev/null)
+  rm -f "$result_file"
+
+  if [ -z "$result" ] || [[ "$result" != *"|"* ]]; then
+    red "No active account found"
+    exit 1
+  fi
+
+  local name="${result%%|*}"
+  local remaining="${result##*|}"
+  local current=$(get_default)
+
+  echo ""
+  if [ "$name" = "$current" ]; then
+    green "Already using best account: $name (${remaining}% remaining)"
+  else
+    cmd_use "$name"
+    green "Switched to $name (${remaining}% remaining)"
+  fi
+}
+
 cmd_run() {
   local name="$1"; shift
   [ ! -d "$ACCOUNTS_DIR/$name" ] && red "Account '$name' not found" && exit 1
@@ -390,6 +546,8 @@ case "$1" in
     cmd_status "${2:-}" ;;
   doctor)
     cmd_doctor ;;
+  balance|bal)
+    cmd_balance ;;
   reauth)
     [ $# -lt 2 ] && red "Usage: codex-multi reauth <name>" && exit 1
     cmd_reauth "$2" ;;
@@ -405,6 +563,7 @@ codex-multi — manage multiple Codex CLI accounts
 
 Commands:
   add <name>              Login and save a new account
+  balance (bal)           Switch to account with most remaining quota
   doctor                  Check health of all accounts + codex-lb
   reauth <name>           Re-login existing account (backup old, re-import to codex-lb)
   import <name> <file|->  Import auth.json from file or stdin
