@@ -10,6 +10,7 @@
 #   codex-multi restore <file>    — restore all accounts/config from archive
 #   codex-multi set lb <addr>     — save codex-lb URL in ~/.codex-multi
 #   codex-multi get lb            — show saved codex-lb URL
+#   codex-multi migrate            — merge history from all accounts into shared ~/.codex
 #   codex-multi status [name]     — check login status
 #   codex-multi <name> [args...]  — run codex with specific account
 #   codex-multi [args...]         — run codex with default account
@@ -104,6 +105,7 @@ cmd_add_remote() {
   local dir="$ACCOUNTS_DIR/$name"
 
   # Start codex login in background — it listens on 127.0.0.1:1455
+  # Use CODEX_HOME directly for login (writes auth.json to account dir)
   CODEX_HOME="$dir" codex login &
   local login_pid=$!
   sleep 2
@@ -304,29 +306,309 @@ cmd_use() {
   [ ! -d "$ACCOUNTS_DIR/$name" ] && red "Account '$name' not found" && exit 1
   echo "$name" > "$DEFAULT_FILE"
 
-  # Symlink ~/.codex → account dir so bare `codex` also uses this account
   local codex_home="$HOME/.codex"
+  local acct_dir="$ACCOUNTS_DIR/$name"
+
+  # Must migrate first if ~/.codex is still a symlink (old layout)
+  if [ -L "$codex_home" ]; then
+    red "~/.codex is a symlink (old layout). Run 'codex-multi migrate' first."
+    exit 1
+  fi
+
+  # Ensure ~/.codex is a real directory
+  if [ ! -d "$codex_home" ]; then
+    mkdir -p "$codex_home"
+  fi
+
+  # Symlink only auth.json and config.toml into ~/.codex
+  for f in auth.json config.toml; do
+    local target="$codex_home/$f"
+    rm -f "$target"
+    ln -s "$acct_dir/$f" "$target"
+  done
+
+  green "Default: $name (codex + codex-multi)"
+}
+
+# Auth-only files that belong to each account (symlinked)
+AUTH_FILES="auth.json config.toml"
+# Shared files/dirs that should live in ~/.codex (merged during migration)
+SHARED_ITEMS="history.jsonl sessions memories shell_snapshots state_5.sqlite logs_1.sqlite cache log tmp skills models_cache.json version.json"
+
+cmd_migrate_undo() {
+  local backup_file
+  backup_file=$(ls -t "$MULTI_HOME"/pre-migrate-*.tar.gz 2>/dev/null | head -1)
+  [ -z "$backup_file" ] && red "No migration backup found in $MULTI_HOME" && exit 1
+
+  dim "Restoring from: $backup_file"
+
+  # Remove current state
+  rm -rf "$HOME/.codex" "$HOME/.codex.merged"
+
+  # Restore from backup
+  tar -xzf "$backup_file" -C "$HOME"
+
+  chmod 700 "$MULTI_HOME" "$ACCOUNTS_DIR" 2>/dev/null || true
+  find "$ACCOUNTS_DIR" -type f -name auth.json -exec chmod 600 {} \; 2>/dev/null || true
+
+  green "Restored to pre-migration state"
+  dim "Backup kept: $backup_file"
+}
+
+cmd_migrate() {
+  local codex_home="$HOME/.codex"
+  local merged_dir="$codex_home.merged"
+
+  local existing_backup
+  existing_backup=$(ls -t "$MULTI_HOME"/pre-migrate-*.tar.gz 2>/dev/null | head -1 || true)
+  if [ -n "$existing_backup" ]; then
+    echo ""
+    dim "Found existing backup: $existing_backup"
+    dim "This could be from a previous failed migration or a successful one."
+    echo ""
+    printf '  [u] Undo — restore from backup, then migrate again\n'
+    printf '  [d] Delete backup and migrate current state\n'
+    printf '  [q] Quit\n'
+    echo ""
+    printf '> '
+    read -r choice
+    case "$choice" in
+      u|U)
+        cmd_migrate_undo
+        ;;
+      d|D)
+        rm -f "$MULTI_HOME"/pre-migrate-*.tar.gz
+        dim "Backup removed"
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+  fi
+
+  # Backup current state (create in /tmp first, then move in)
+  local backup_name="pre-migrate-$(date +%Y%m%d-%H%M%S).tar.gz"
+  local backup_tmp="/tmp/$backup_name"
+  local backup_file="$MULTI_HOME/$backup_name"
+  dim "Backing up → $backup_file"
+  tar -czf "$backup_tmp" -C "$HOME" .codex-multi/ .codex || { red "Backup failed — aborting migration"; rm -f "$backup_tmp"; exit 1; }
+  mv "$backup_tmp" "$backup_file"
+  chmod 600 "$backup_file"
+  green "Backup saved: $backup_file"
+
+  dim "Migrating to shared-history layout..."
+
+  # Create merged dir
+  mkdir -p "$merged_dir"
+
+  # Merge data from all account dirs
+  local history_tmp=$(mktemp)
+  for acct_dir in "$ACCOUNTS_DIR"/*/; do
+    [ ! -d "$acct_dir" ] && continue
+    local acct_name=$(basename "$acct_dir")
+
+    # Merge history.jsonl (append, deduplicate later)
+    if [ -f "$acct_dir/history.jsonl" ]; then
+      cat "$acct_dir/history.jsonl" >> "$history_tmp"
+    fi
+
+    # Merge sessions (copy without overwriting)
+    if [ -d "$acct_dir/sessions" ]; then
+      cp -rn "$acct_dir/sessions/." "$merged_dir/sessions/" 2>/dev/null || true
+    fi
+
+    # Merge memories
+    if [ -d "$acct_dir/memories" ]; then
+      cp -rn "$acct_dir/memories/." "$merged_dir/memories/" 2>/dev/null || true
+    fi
+
+    # Merge shell_snapshots
+    if [ -d "$acct_dir/shell_snapshots" ]; then
+      cp -rn "$acct_dir/shell_snapshots/." "$merged_dir/shell_snapshots/" 2>/dev/null || true
+    fi
+
+    # Copy other shared files (keep latest by mtime)
+    for f in models_cache.json version.json; do
+      if [ -f "$acct_dir/$f" ]; then
+        if [ ! -f "$merged_dir/$f" ] || [ "$acct_dir/$f" -nt "$merged_dir/$f" ]; then
+          cp "$acct_dir/$f" "$merged_dir/$f"
+        fi
+      fi
+    done
+
+    # Copy dirs (keep latest content, don't overwrite)
+    for d in cache log tmp skills; do
+      if [ -d "$acct_dir/$d" ]; then
+        mkdir -p "$merged_dir/$d"
+        cp -rn "$acct_dir/$d/." "$merged_dir/$d/" 2>/dev/null || true
+      fi
+    done
+  done
+
+  # Deduplicate and sort history by timestamp
+  if [ -s "$history_tmp" ]; then
+    python3 -c "
+import json, sys
+
+seen = set()
+entries = []
+for line in open('$history_tmp'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+        key = (obj.get('session_id',''), obj.get('ts',0), obj.get('text',''))
+        if key not in seen:
+            seen.add(key)
+            entries.append((obj.get('ts',0), line))
+    except:
+        entries.append((0, line))
+
+entries.sort(key=lambda x: x[0])
+with open('$merged_dir/history.jsonl', 'w') as f:
+    for _, line in entries:
+        f.write(line + '\n')
+" 2>/dev/null
+  fi
+  rm -f "$history_tmp"
+
+  # Merge sqlite databases
+  cmd_migrate_sqlite "$merged_dir"
+
+  # Verify merged results before committing
+  local src_history=0 merged_history=0 src_threads=0 merged_threads=0
+  for acct_dir in "$ACCOUNTS_DIR"/*/; do
+    if [ -f "$acct_dir/history.jsonl" ]; then
+      src_history=$((src_history + $(wc -l < "$acct_dir/history.jsonl")))
+    fi
+    if [ -f "$acct_dir/state_5.sqlite" ]; then
+      src_threads=$((src_threads + $(python3 -c "
+import sqlite3; print(sqlite3.connect('$acct_dir/state_5.sqlite').execute('SELECT count(*) FROM threads').fetchone()[0])
+" 2>/dev/null || echo 0)))
+    fi
+  done
+  if [ -f "$merged_dir/history.jsonl" ]; then
+    merged_history=$(wc -l < "$merged_dir/history.jsonl")
+  fi
+  if [ -f "$merged_dir/state_5.sqlite" ]; then
+    merged_threads=$(python3 -c "
+import sqlite3; print(sqlite3.connect('$merged_dir/state_5.sqlite').execute('SELECT count(*) FROM threads').fetchone()[0])
+" 2>/dev/null || echo 0)
+  fi
+
+  dim "Verify: history $merged_history/$src_history lines, threads $merged_threads/$src_threads"
+
+  # merged_history can be <= src_history due to dedup, but should not be 0 if source had data
+  if [ "$src_history" -gt 0 ] && [ "$merged_history" -eq 0 ]; then
+    red "Verification failed: history lost after merge. Run 'cm migrate --undo' to restore."
+    exit 1
+  fi
+  if [ "$src_threads" -gt 0 ] && [ "$merged_threads" -eq 0 ]; then
+    red "Verification failed: threads lost after merge. Run 'cm migrate --undo' to restore."
+    exit 1
+  fi
+
+  # Replace ~/.codex with merged dir
   if [ -L "$codex_home" ]; then
     rm "$codex_home"
   elif [ -d "$codex_home" ]; then
-    # Backup original ~/.codex if it's a real directory (first time only)
-    if [ ! -d "$codex_home.bak" ]; then
-      mv "$codex_home" "$codex_home.bak"
-      dim "Original ~/.codex backed up to ~/.codex.bak"
-    else
-      rm -rf "$codex_home"
-    fi
+    mv "$codex_home" "$codex_home.bak.$(date +%s)"
   fi
+  mv "$merged_dir" "$codex_home"
 
-  ln -s "$ACCOUNTS_DIR/$name" "$codex_home"
-  green "Default: $name (codex + codex-multi)"
+  # Clean shared files from account dirs (keep only auth files)
+  for acct_dir in "$ACCOUNTS_DIR"/*/; do
+    [ ! -d "$acct_dir" ] && continue
+    for item in $SHARED_ITEMS; do
+      if [ -e "$acct_dir/$item" ]; then
+        rm -rf "$acct_dir/$item"
+      fi
+    done
+    # Clean sqlite WAL/SHM files
+    rm -f "$acct_dir"/*.sqlite-wal "$acct_dir"/*.sqlite-shm
+    # Clean misc files
+    rm -f "$acct_dir/.personality_migration"
+  done
+
+  green "Migration complete — history/sessions merged into ~/.codex"
+  dim "Backup kept: $(ls -t "$MULTI_HOME"/pre-migrate-*.tar.gz 2>/dev/null | head -1)"
+  dim "Run 'cm migrate --undo' to revert, or 'cm migrate --clean' to remove backup"
+}
+
+cmd_migrate_sqlite() {
+  local dest_dir="$1"
+  python3 -c "
+import sqlite3, os, glob, shutil, sys
+
+accounts_dir = '$ACCOUNTS_DIR'
+
+for db_name in ['state_5.sqlite', 'logs_1.sqlite']:
+    db_files = sorted(glob.glob(os.path.join(accounts_dir, '*', db_name)))
+    if not db_files:
+        continue
+
+    dest_db = os.path.join('$dest_dir', db_name)
+    db_files.sort(key=lambda f: os.path.getsize(f), reverse=True)
+
+    # Find first valid db as base
+    base = None
+    for f in db_files:
+        try:
+            conn = sqlite3.connect(f)
+            conn.execute('SELECT count(*) FROM sqlite_master')
+            conn.close()
+            base = f
+            break
+        except Exception:
+            print(f'  skip corrupt: {f}', file=sys.stderr)
+
+    if not base:
+        continue
+
+    shutil.copy2(base, dest_db)
+    dest_conn = sqlite3.connect(dest_db)
+    dest_conn.execute('PRAGMA journal_mode=WAL')
+
+    for src_file in db_files:
+        if src_file == base:
+            continue
+        try:
+            src_conn = sqlite3.connect(src_file)
+            tables = [r[0] for r in src_conn.execute(
+                \"SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '_sqlx%'\"
+            ).fetchall()]
+
+            for table in tables:
+                try:
+                    cols = [r[1] for r in src_conn.execute(f'PRAGMA table_info({table})').fetchall()]
+                    rows = src_conn.execute(f'SELECT * FROM {table}').fetchall()
+                    if rows:
+                        placeholders = ','.join(['?'] * len(cols))
+                        dest_conn.executemany(
+                            f'INSERT OR IGNORE INTO {table} VALUES ({placeholders})',
+                            rows
+                        )
+                except Exception:
+                    pass
+
+            src_conn.close()
+        except Exception:
+            pass
+
+    dest_conn.commit()
+    dest_conn.close()
+"
 }
 
 cmd_status() {
   local name="${1:-$(get_default)}"
   [ -z "$name" ] && red "No account specified and no default set" && exit 1
   [ ! -d "$ACCOUNTS_DIR/$name" ] && red "Account '$name' not found" && exit 1
-  CODEX_HOME="$ACCOUNTS_DIR/$name" codex login status
+  local prev_default=$(get_default)
+  cmd_use "$name" > /dev/null
+  codex login status
+  [ -n "$prev_default" ] && [ "$prev_default" != "$name" ] && cmd_use "$prev_default" > /dev/null
 }
 
 cmd_reauth() {
@@ -371,7 +653,8 @@ cmd_add_internal() {
   if [ -n "${SSH_CONNECTION:-}" ]; then
     cmd_add_remote "$name"
   else
-    CODEX_HOME="$dir" codex login
+    cmd_use "$name" > /dev/null 2>&1 || true
+    codex login
     local email=$(get_email "$dir")
     [ -n "$email" ] && green "Done: $name ($email)" || green "Done: $name"
   fi
@@ -662,13 +945,21 @@ if best_name:
 cmd_run() {
   local name="$1"; shift
   [ ! -d "$ACCOUNTS_DIR/$name" ] && red "Account '$name' not found" && exit 1
-  CODEX_HOME="$ACCOUNTS_DIR/$name" codex "$@"
+
+  # Temporarily switch auth to requested account, run codex, then restore
+  local codex_home="$HOME/.codex"
+  local prev_default=$(get_default)
+  cmd_use "$name" > /dev/null
+  codex "$@"
+  local exit_code=$?
+  [ -n "$prev_default" ] && [ "$prev_default" != "$name" ] && cmd_use "$prev_default" > /dev/null
+  return $exit_code
 }
 
 cmd_run_default() {
   local default=$(get_default)
   [ -z "$default" ] && red "No default account. Run: codex-multi add <name>" && exit 1
-  CODEX_HOME="$ACCOUNTS_DIR/$default" codex "$@"
+  codex "$@"
 }
 
 # --- Main ---
@@ -699,6 +990,14 @@ case "$1" in
     cmd_doctor ;;
   balance|bal)
     cmd_balance ;;
+  migrate)
+    case "${2:-}" in
+      --undo)  cmd_migrate_undo ;;
+      --clean) rm -f "$MULTI_HOME"/pre-migrate-*.tar.gz && green "Migration backups removed" ;;
+      "")      cmd_migrate ;;
+      *)       red "Usage: codex-multi migrate [--undo|--clean]" && exit 1 ;;
+    esac
+    ;;
   backup)
     [ $# -lt 2 ] && red "Usage: codex-multi backup <file.tar.gz>" && exit 1
     cmd_backup "$2" ;;
@@ -736,6 +1035,9 @@ Commands:
   restore <file.tar.gz>   Restore all accounts/config from archive
   reauth [--lb] <name>    Re-login existing account (--lb to also import to codex-lb)
   set lb <addr>           Save codex-lb URL (supports ip:port, http://, https://)
+  migrate                 Merge history/sessions from all accounts into shared ~/.codex
+  migrate --undo          Restore pre-migration backup
+  migrate --clean         Remove migration backup
   import <name> <file|->  Import auth.json from file or stdin
   export <name>           Print auth.json to stdout
   rm <name>               Remove an account
