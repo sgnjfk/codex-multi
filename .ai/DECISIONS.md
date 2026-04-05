@@ -11,6 +11,13 @@
 **Decision:** `cm use <name>` creates symlink `~/.codex → ~/.codex-multi/accounts/<name>/`. Original `~/.codex` backed up to `~/.codex.bak` on first run.
 **Alternatives:** Patch codex CLI, always use CODEX_HOME wrapper
 **Consequences:** Bare `codex` works without any wrapper. Symlink must be maintained — if deleted, codex falls back to no auth.
+**Superseded by:** 2026-04-02 decision below.
+
+## [2026-04-02] Auth-only symlink, shared history/config
+**Context:** Old layout symlinked entire `~/.codex` → account dir. Switching accounts lost conversation history, sessions, and state in the same working directory.
+**Decision:** `~/.codex` is a real directory. Only `auth.json` is symlinked per account. Everything else (config.toml, history.jsonl, sessions/, state_5.sqlite) stays shared. One-time `cm migrate` merges scattered data from old per-account dirs.
+**Alternatives:** Per-directory history (codex doesn't support), CODEX_HOME wrapper (same problem), copy-on-switch (slow, diverges)
+**Consequences:** History persists across account switches. config.toml is shared — all accounts use same settings. Migration has backup/undo/verify for safety.
 
 ## [2025-03-17] Remote OAuth via callback URL paste
 **Context:** On SSH/headless machines, `codex login` opens a browser which doesn't exist. Need a way to complete OAuth.

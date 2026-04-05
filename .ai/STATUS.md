@@ -1,17 +1,14 @@
 # Status
 
 ## Current State
-Project is stable. All core commands working, codex-lb integration is config-based (no hardcoded URLs).
+Project is stable. Shared-history layout landed and migrated on WSL. All core commands working.
 
-## Recent Work (2026-03-28)
-- Refactored: removed all hardcoded IPs, codex-lb URL now read from `~/.codex-multi/config`
-- `reauth --lb` flag: default no longer posts to lb, must opt-in
-- Added export endpoint to codex-lb fork (sgnjfk/codex-lb, branch feat/export-endpoint)
-- Simplified cm-sync: from SSH+SQLite+Fernet decrypt → single curl to `/api/accounts/export`
-- Moved private scripts (cm-sync) to `~/dotfiles/scripts/codex-multi/`
-- Fixed doctor: access token expired is now dim (info) not red (warning), since it auto-refreshes
-- Set up SSH key-based auth WSL ↔ Pi (user pp, host alias pi88)
-- Changed dotfiles repo to private on GitHub
+## Recent Work (2026-04-05)
+- Switched from whole-dir symlink to auth-only symlink: `~/.codex` is now a real dir, only `auth.json` symlinked per account
+- Added `cm migrate` with backup/undo/verify to merge history/sessions/state from all account dirs
+- config.toml is now shared (not per-account)
+- Fixed `cmd_run`/`cmd_status` to always restore previous account even if codex fails (set -e safe)
+- Removed dead code (AUTH_FILES variable)
 
 ## Known Issues
 - No automated tests

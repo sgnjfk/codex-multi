@@ -320,20 +320,15 @@ cmd_use() {
     mkdir -p "$codex_home"
   fi
 
-  # Symlink only auth.json and config.toml into ~/.codex
-  for f in auth.json config.toml; do
-    local target="$codex_home/$f"
-    rm -f "$target"
-    ln -s "$acct_dir/$f" "$target"
-  done
+  # Symlink only auth.json into ~/.codex (config.toml is shared, not per-account)
+  rm -f "$codex_home/auth.json"
+  ln -s "$acct_dir/auth.json" "$codex_home/auth.json"
 
   green "Default: $name (codex + codex-multi)"
 }
 
-# Auth-only files that belong to each account (symlinked)
-AUTH_FILES="auth.json config.toml"
 # Shared files/dirs that should live in ~/.codex (merged during migration)
-SHARED_ITEMS="history.jsonl sessions memories shell_snapshots state_5.sqlite logs_1.sqlite cache log tmp skills models_cache.json version.json"
+SHARED_ITEMS="config.toml history.jsonl sessions memories shell_snapshots state_5.sqlite logs_1.sqlite cache log tmp skills models_cache.json version.json"
 
 cmd_migrate_undo() {
   local backup_file
@@ -425,6 +420,14 @@ cmd_migrate() {
     # Merge shell_snapshots
     if [ -d "$acct_dir/shell_snapshots" ]; then
       cp -rn "$acct_dir/shell_snapshots/." "$merged_dir/shell_snapshots/" 2>/dev/null || true
+    fi
+
+    # Pick the most complete config.toml (most lines = most settings)
+    if [ -f "$acct_dir/config.toml" ]; then
+      if [ ! -f "$merged_dir/config.toml" ] || \
+         [ "$(wc -l < "$acct_dir/config.toml")" -gt "$(wc -l < "$merged_dir/config.toml")" ]; then
+        cp "$acct_dir/config.toml" "$merged_dir/config.toml"
+      fi
     fi
 
     # Copy other shared files (keep latest by mtime)
@@ -607,8 +610,10 @@ cmd_status() {
   [ ! -d "$ACCOUNTS_DIR/$name" ] && red "Account '$name' not found" && exit 1
   local prev_default=$(get_default)
   cmd_use "$name" > /dev/null
-  codex login status
+  local exit_code=0
+  codex login status || exit_code=$?
   [ -n "$prev_default" ] && [ "$prev_default" != "$name" ] && cmd_use "$prev_default" > /dev/null
+  return $exit_code
 }
 
 cmd_reauth() {
@@ -946,12 +951,10 @@ cmd_run() {
   local name="$1"; shift
   [ ! -d "$ACCOUNTS_DIR/$name" ] && red "Account '$name' not found" && exit 1
 
-  # Temporarily switch auth to requested account, run codex, then restore
-  local codex_home="$HOME/.codex"
   local prev_default=$(get_default)
   cmd_use "$name" > /dev/null
-  codex "$@"
-  local exit_code=$?
+  local exit_code=0
+  codex "$@" || exit_code=$?
   [ -n "$prev_default" ] && [ "$prev_default" != "$name" ] && cmd_use "$prev_default" > /dev/null
   return $exit_code
 }

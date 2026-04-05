@@ -21,12 +21,16 @@ docs/                    # setup guides (WSL SSH Task Scheduler)
 ├── default              # name of current default account
 └── accounts/
     └── <name>/
-        ├── auth.json    # OAuth tokens (refresh + access + id)
-        └── config.toml  # codex config
-~/.codex → ~/.codex-multi/accounts/<default>/  (symlink)
+        └── auth.json    # OAuth tokens (refresh + access + id)
+~/.codex/                # codex runtime (real directory)
+├── auth.json → account symlink  # only this switches per account
+├── config.toml          # shared across all accounts
+├── history.jsonl         # shared conversation history
+├── sessions/            # shared sessions
+└── state_5.sqlite       # shared state
 ```
 
-Key design: `cm use <name>` symlinks `~/.codex` → account dir, so both `codex-multi` and bare `codex` CLI use the same account.
+Key design: `cm use <name>` symlinks only `~/.codex/auth.json` → account dir. Everything else (history, sessions, config, state) stays in `~/.codex/` and persists across account switches.
 
 ## Commands
 | Command | Description |
@@ -42,6 +46,9 @@ Key design: `cm use <name>` symlinks `~/.codex` → account dir, so both `codex-
 | `export <name>` | Print auth.json to stdout |
 | `backup <file>` | Archive all accounts/config |
 | `restore <file>` | Restore from archive |
+| `migrate` | One-time: merge history/sessions from all accounts into shared ~/.codex |
+| `migrate --undo` | Restore pre-migration backup |
+| `migrate --clean` | Remove migration backup |
 | `status [name]` | Check login status |
 | `<name> [args]` | Run codex with specific account |
 
@@ -58,7 +65,7 @@ No test suite currently. Manual testing via `cm doctor` and `cm status`.
 - Color output: `red()` for errors, `green()` for success, `dim()` for hints
 - No hardcoded URLs — codex-lb integration via `~/.codex-multi/config`
 - Commit messages in English, imperative mood
-- `CODEX_HOME` env var controls which account `codex` uses
+- Account switching via auth.json symlink only — history/sessions/config shared in `~/.codex/`
 
 ## Context Files
 - `.ai/STATUS.md` — Current progress and next steps
