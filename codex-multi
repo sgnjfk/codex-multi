@@ -10,6 +10,8 @@
 #   codex-multi restore <file>    — restore all accounts/config from archive
 #   codex-multi set lb <addr>     — save codex-lb URL in ~/.codex-multi
 #   codex-multi get lb            — show saved codex-lb URL
+#   codex-multi set api-key <key> — save codex-lb API key
+#   codex-multi get api-key       — show saved codex-lb API key
 #   codex-multi migrate            — merge history from all accounts into shared ~/.codex
 #   codex-multi status [name]     — check login status
 #   codex-multi <name> [args...]  — run codex with specific account
@@ -45,6 +47,21 @@ set_config() {
     echo "${key}=${value}" >> "$CONFIG_FILE"
   fi
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
+get_lb_api_key() {
+  get_config lb_api_key
+}
+
+# curl wrapper that injects "Authorization: Bearer <key>" when api-key is configured.
+lb_curl() {
+  local key
+  key=$(get_lb_api_key)
+  if [ -n "$key" ]; then
+    curl -H "Authorization: Bearer $key" "$@"
+  else
+    curl "$@"
+  fi
 }
 
 normalize_lb_url() {
@@ -208,9 +225,14 @@ cmd_set() {
       set_config "lb_url" "$normalized"
       green "codex-lb URL saved: $normalized"
       ;;
+    api-key|api_key)
+      [ -z "$value" ] && red "Usage: codex-multi set api-key <key>" && exit 1
+      set_config "lb_api_key" "$value"
+      green "codex-lb API key saved"
+      ;;
     *)
       red "Unknown setting: $key"
-      dim "Supported: lb"
+      dim "Supported: lb, api-key"
       exit 1
       ;;
   esac
@@ -226,9 +248,15 @@ cmd_get() {
       [ -z "$url" ] && red "codex-lb URL not set" && dim "Run: codex-multi set lb <ip:port>" && exit 1
       printf '%s\n' "$url"
       ;;
+    api-key|api_key)
+      local k
+      k=$(get_lb_api_key)
+      [ -z "$k" ] && red "codex-lb API key not set" && dim "Run: codex-multi set api-key <key>" && exit 1
+      printf '%s\n' "$k"
+      ;;
     *)
       red "Unknown setting: $key"
-      dim "Supported: lb"
+      dim "Supported: lb, api-key"
       exit 1
       ;;
   esac
@@ -638,15 +666,26 @@ cmd_reauth() {
     fi
     dim "Importing to codex-lb..."
     local lb_resp
-    lb_resp=$(curl -s --max-time 10 -w "\n%{http_code}" -X POST \
+    lb_resp=$(lb_curl -s --max-time 10 -w "\n%{http_code}" -X POST \
       "$lb_url/api/accounts/import" \
       -F "auth_json=@$dir/auth.json" 2>&1)
     local http_code=$(echo "$lb_resp" | tail -1)
-    if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
-      green "Re-imported to codex-lb"
-    else
-      red "codex-lb import failed (HTTP $http_code)"
-    fi
+    case "$http_code" in
+      200|201)
+        green "Re-imported to codex-lb"
+        ;;
+      401|403)
+        red "codex-lb import failed: auth (HTTP $http_code)"
+        if [ -z "$(get_lb_api_key)" ]; then
+          dim "  → cm set api-key <key>"
+        else
+          dim "  → API key invalid; cm set api-key <new-key>"
+        fi
+        ;;
+      *)
+        red "codex-lb import failed (HTTP $http_code)"
+        ;;
+    esac
   fi
 }
 
@@ -676,17 +715,38 @@ cmd_doctor() {
   echo ""
 
   # Check codex-lb
-  if [ -n "$codex_lb_url" ] && curl -sf "$codex_lb_url/api/accounts" > /dev/null 2>&1; then
-    codex_lb_up=true
-    green "codex-lb: running"
-    dim "  → $codex_lb_url"
-  elif [ -z "$codex_lb_url" ]; then
+  if [ -z "$codex_lb_url" ]; then
     dim "codex-lb: not configured"
     dim "  → cm set lb <ip:port>"
   else
-    red "codex-lb: not running"
-    dim "  → sudo docker start codex-lb"
-    has_issue=1
+    local http_code
+    http_code=$(lb_curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$codex_lb_url/api/accounts" 2>/dev/null) || http_code="000"
+    case "$http_code" in
+      200)
+        codex_lb_up=true
+        green "codex-lb: running"
+        dim "  → $codex_lb_url"
+        ;;
+      401|403)
+        red "codex-lb: auth failed (HTTP $http_code)"
+        if [ -z "$(get_lb_api_key)" ]; then
+          dim "  → cm set api-key <key>"
+        else
+          dim "  → API key invalid; cm set api-key <new-key>"
+        fi
+        has_issue=1
+        ;;
+      000)
+        red "codex-lb: not running"
+        dim "  → sudo docker start codex-lb"
+        has_issue=1
+        ;;
+      *)
+        red "codex-lb: unhealthy (HTTP $http_code)"
+        dim "  → $codex_lb_url"
+        has_issue=1
+        ;;
+    esac
   fi
 
   echo ""
@@ -740,10 +800,16 @@ except: print('unknown')
     dim "━━━ codex-lb accounts ━━━"
     echo ""
 
+    local lb_api_key
+    lb_api_key=$(get_lb_api_key)
     python3 -c "
 import urllib.request, json
 
-resp = urllib.request.urlopen('$codex_lb_url/api/accounts')
+req = urllib.request.Request('$codex_lb_url/api/accounts')
+api_key = '$lb_api_key'
+if api_key:
+    req.add_header('Authorization', f'Bearer {api_key}')
+resp = urllib.request.urlopen(req)
 data = json.loads(resp.read())
 
 for acc in data.get('accounts', []):
@@ -769,8 +835,8 @@ for acc in data.get('accounts', []):
         print(f'\033[90m  → Check codex-lb dashboard: $codex_lb_url\033[0m')
 " 2>/dev/null
 
-    local active=$(curl -sf "$codex_lb_url/api/accounts" | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for a in d['accounts'] if a['status']=='active'))" 2>/dev/null)
-    local total=$(curl -sf "$codex_lb_url/api/accounts" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['accounts']))" 2>/dev/null)
+    local active=$(lb_curl -sf "$codex_lb_url/api/accounts" | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for a in d['accounts'] if a['status']=='active'))" 2>/dev/null)
+    local total=$(lb_curl -sf "$codex_lb_url/api/accounts" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d['accounts']))" 2>/dev/null)
 
     echo ""
     if [ "$active" = "0" ]; then
@@ -792,10 +858,16 @@ cmd_balance_lb() {
   local codex_lb_url
   codex_lb_url=$(get_config lb_url)
   [ -z "$codex_lb_url" ] && return 1
+  local lb_api_key
+  lb_api_key=$(get_lb_api_key)
   python3 -c "
 import urllib.request, json, os, base64
 
-resp = urllib.request.urlopen('$codex_lb_url/api/accounts', timeout=3)
+req = urllib.request.Request('$codex_lb_url/api/accounts')
+api_key = '$lb_api_key'
+if api_key:
+    req.add_header('Authorization', f'Bearer {api_key}')
+resp = urllib.request.urlopen(req, timeout=3)
 data = json.loads(resp.read())
 accounts_dir = '$ACCOUNTS_DIR'
 
@@ -840,7 +912,7 @@ cmd_balance() {
   codex_lb_url=$(get_config lb_url)
 
   # Try codex-lb first (fast, cached)
-  if [ -n "$codex_lb_url" ] && curl -sf "$codex_lb_url/api/accounts" > /dev/null 2>&1; then
+  if [ -n "$codex_lb_url" ] && lb_curl -sf "$codex_lb_url/api/accounts" > /dev/null 2>&1; then
     dim "via codex-lb"
     cmd_balance_lb "$result_file"
   fi
@@ -982,10 +1054,10 @@ case "$1" in
     [ $# -lt 2 ] && red "Usage: codex-multi use <name>" && exit 1
     cmd_use "$2" ;;
   set)
-    [ $# -lt 3 ] && red "Usage: codex-multi set lb <ip:port | http://host:port | https://host:port>" && exit 1
+    [ $# -lt 3 ] && red "Usage: codex-multi set <lb|api-key> <value>" && exit 1
     cmd_set "$2" "$3" ;;
   get)
-    [ $# -lt 2 ] && red "Usage: codex-multi get lb" && exit 1
+    [ $# -lt 2 ] && red "Usage: codex-multi get <lb|api-key>" && exit 1
     cmd_get "$2" ;;
   status)
     cmd_status "${2:-}" ;;
@@ -1035,9 +1107,11 @@ Commands:
   backup <file.tar.gz>    Archive all accounts/config for transfer
   doctor                  Check health of all accounts + codex-lb
   get lb                  Show saved codex-lb URL
+  get api-key             Show saved codex-lb API key
   restore <file.tar.gz>   Restore all accounts/config from archive
   reauth [--lb] <name>    Re-login existing account (--lb to also import to codex-lb)
   set lb <addr>           Save codex-lb URL (supports ip:port, http://, https://)
+  set api-key <key>       Save codex-lb API key (sent as Authorization: Bearer <key>)
   migrate                 Merge history/sessions from all accounts into shared ~/.codex
   migrate --undo          Restore pre-migration backup
   migrate --clean         Remove migration backup
@@ -1059,6 +1133,7 @@ Examples:
   codex-multi add personal
   codex-multi backup /tmp/codex-multi.tar.gz
   codex-multi set lb 192.168.1.88:2455
+  codex-multi set api-key sk-clb-...
   codex-multi restore /tmp/codex-multi.tar.gz
   codex-multi import work /tmp/auth.json
   codex-multi use personal
